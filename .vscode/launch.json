@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run 40NetSim",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/bin/40NetSim",
+            "cwd": "${workspaceRoot}",
+            "console": "integratedTerminal"
+        }
+    ]
+}
