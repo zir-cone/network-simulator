@@ -1,8 +1,10 @@
 #include "Renderer.hpp"
 #include <cmath>
+#include <algorithm>
 
 Renderer::Renderer(sf::RenderWindow& window, Network& network)
-    : window_(window), network_(network) {
+    : window_(window), network_(network) 
+{
     updateLayout();
 }
 
@@ -40,6 +42,8 @@ void Renderer::updateLayout()
         visuals_.push_back(NodeVisual{ devices[i]->id(), pos });
     }
 }
+
+
 
 void Renderer::draw() 
 {
@@ -105,4 +109,49 @@ void Renderer::draw()
         }
         window_.draw(circle);
     }
+}
+
+int Renderer::pickNode(const sf::Vector2f& p) const 
+{
+    const float radius = 14.f;
+    const float radius2 = radius * radius;
+
+    for (const auto& v : visuals_) {
+        sf::Vector2f d = p - v.position;
+        if (d.x * d.x + d.y * d.y <= radius2 * 1.5f * 1.5f) {
+            return v.deviceId;
+        }
+    }
+    return -1;
+}
+
+static float distanceToSegment(sf::Vector2f p, sf::Vector2f a, sf::Vector2f b)
+{
+    sf::Vector2f ab = b - a;
+    float ab2 = ab.x * ab.x + ab.y * ab.y;
+    if (ab2 == 0.f) return 1e9f;
+    float t = ((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / ab2;
+    t = std::max(0.f, std::min(1.f, t));
+    sf::Vector2f proj = a + t * ab;
+    sf::Vector2f d = p - proj;
+    return std::sqrt(d.x * d.x + d.y * d.y); 
+}
+
+int Renderer::pickLink(const sf::Vector2f& p) const 
+{
+    float bestDist = 8.f; // click tolerance in pixels
+    int bestId = -1;
+
+    for (const auto& link : network_.links()) {
+        const NodeVisual* a = findNodeVisual(link.nodeA);
+        const NodeVisual* b = findNodeVisual(link.nodeB);
+        if (!a || !b) continue;
+
+        float d = distanceToSegment(p, a->position, b->position);
+        if (d < bestDist) {
+            bestDist = d;
+            bestId = link.id;
+        }
+    }
+    return bestId;
 }

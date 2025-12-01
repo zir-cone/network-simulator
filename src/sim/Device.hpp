@@ -36,6 +36,16 @@ struct Packet {
     ApplicationProtocol app = ApplicationProtocol::OTHER;
 };
 
+struct DeviceInfo 
+{
+    std::string name;
+    std::string user;
+    std::string type;
+    std::string localIp;
+    std::string publicIp;
+    std::string mac;
+};
+
 
 class Device 
 {
@@ -44,6 +54,7 @@ public:
         : id_(id), scope_(scope) {}
 
     virtual ~Device() = default;
+    virtual DeviceInfo info() const = 0;
 
     int id() const { return id_; }
     NetworkScope scope() const { return scope_; }

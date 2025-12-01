@@ -2,58 +2,153 @@
 #include <memory>
 #include <iostream>
 #include <random>
+#include <cctype>
+#include <cstdio>
 
 #include "sim/Network.hpp"
 #include "sim/Simulation.hpp"
 #include "gui/Renderer.hpp"
 #include "sim/Device.hpp"
 
-// simple home device class
-class HomeDevice : public Device {
+// ------------------------
+// Device types
+// ------------------------
+
+class HomeDevice : public Device
+{
 public:
     HomeDevice(int id, NetworkScope scope, std::string ip, std::string name)
-        : Device(id, scope), ip_(std::move(ip)), name_(std::move(name)) {}
+        : Device(id, scope),
+          ip_(std::move(ip)),
+          name_(std::move(name))
+    {
+        // deduce rough type and user from name
+        std::string lower = name_;
+        for (char &c : lower) c = static_cast<char>(std::tolower(c));
 
-    const std::string& ip() const { return ip_; }
-    const std::string& name() const { return name_; }
+        if (lower.find("desktop") != std::string::npos)
+            type_ = "Desktop PC";
+        else if (lower.find("laptop") != std::string::npos)
+            type_ = "Laptop";
+        else if (lower.find("phone") != std::string::npos)
+            type_ = "Smartphone";
+        else if (lower.find("television") != std::string::npos ||
+                 lower.find("tv") != std::string::npos)
+            type_ = "Smart TV";
+        else if (lower.find("fridge") != std::string::npos)
+            type_ = "Smart Fridge";
+        else if (lower.find("tablet") != std::string::npos)
+            type_ = "Tablet";
+        else
+            type_ = "Endpoint";
 
-    void tick(double now) override {
-        // no internal behavior atm; traffic is driven in main via timers.
-        (void)now;
+        if (lower.find("john") != std::string::npos)
+            user_ = "John";
+        else
+            user_ = "Family";
+
+        // simple deterministic MAC from id
+        char buf[18];
+        std::snprintf(buf, sizeof(buf), "02:00:00:00:%02X:%02X",
+                      (id >> 8) & 0xFF, id & 0xFF);
+        mac_ = buf;
+
+        publicIp_ = "203.0.113.5"; // example public IPv4 addr
     }
 
-    void onPacketReceived(const Packet& pkt) override {
-        // debugging:
-        // std::cout << "[" << name_ << "] got packet from node "
-        //           << pkt.srcNodeId << " dstPort=" << pkt.dstPort << "\n";
+    const std::string& ip()       const { return ip_; }
+    const std::string& name()     const { return name_; }
+    const std::string& type()     const { return type_; }
+    const std::string& user()     const { return user_; }
+    const std::string& mac()      const { return mac_; }
+    const std::string& publicIp() const { return publicIp_; }
+
+    void tick(double now) override
+    {
+        (void)now; // no internal behavior atm; traffic driven by main()
+    }
+
+    void onPacketReceived(const Packet& pkt) override
+    {
+        // Placeholder for debugging
         (void)pkt;
+    }
+
+    DeviceInfo info() const override
+    {
+        return DeviceInfo{
+            name_,
+            user_,
+            type_,
+            ip_,
+            publicIp_,
+            mac_
+        };
     }
 
 private:
     std::string ip_;
     std::string name_;
+    std::string type_;
+    std::string user_;
+    std::string mac_;
+    std::string publicIp_;
 };
 
-class RouterDevice : public Device {
+class RouterDevice : public Device
+{
 public:
     RouterDevice(int id, NetworkScope scope, std::string ip)
         : Device(id, scope), ip_(std::move(ip)) {}
 
     const std::string& ip() const { return ip_; }
 
-    void tick(double now) override { (void)now; }
-
-    void onPacketReceived(const Packet& pkt) override {
-        // from the LAN's POV, router mainly forwards out or back in.
-        // internet responses are faked in main().
-        (void)pkt;
+    void tick(double /*now*/) override
+    {
+        // main() will inspect pending queues and emulate WAN side
     }
+
+    void onPacketReceived(const Packet& pkt) override
+    {
+        // Packets arriving from LAN to router
+        if (pkt.dstPort == 53 && pkt.app == ApplicationProtocol::DNS) {
+            pendingDns_.push_back(pkt);
+        } else if (pkt.dstPort == 443 && pkt.app == ApplicationProtocol::HTTPS) {
+            pendingHttps_.push_back(pkt);
+        }
+    }
+
+    DeviceInfo info() const override
+    {
+        return DeviceInfo{
+            "home-router",
+            "ISP",
+            "Router",
+            ip_,
+            "203.0.113.1",
+            "00:11:22:33:44:55"
+        };
+    }
+
+    std::vector<Packet> pendingDns_;
+    std::vector<Packet> pendingHttps_;
 
 private:
     std::string ip_;
 };
 
-int main() {
+struct ScheduledPacket
+{
+    Packet pkt;
+    int    fromNode;
+    int    toNode;
+    double sendAt;   // simulation time when to inject into LAN
+};
+
+// main
+
+int main()
+{
     const unsigned WIDTH  = 1280;
     const unsigned HEIGHT = 720;
 
@@ -64,6 +159,7 @@ int main() {
     window.setFramerateLimit(60);
 
     Network network;
+    std::vector<ScheduledPacket> scheduledPackets;
 
     int nextId = 0;
 
@@ -77,12 +173,12 @@ int main() {
         int id = network.addDevice(
             std::make_unique<HomeDevice>(nextId++, NetworkScope::Local, ip, name)
         );
-        // connect via wireless fidelity or ethernet; here just randomize the latency a bit
-        // tvs and desktops --> faster / lower latency to simulate ethernet
+        // connect via wi-fi or ethernet
         double bw   = 100.0; // Mbps
         double lat  = 5.0;   // ms
         if (name.find("TV") != std::string::npos ||
-            name.find("Desktop") != std::string::npos) {
+            name.find("Desktop") != std::string::npos ||
+            name.find("television") != std::string::npos) {
             bw  = 1000.0;
             lat = 1.0;
         }
@@ -90,25 +186,29 @@ int main() {
         return id;
     };
 
-    // household devices
+    // Household devices
     int familyPcId     = addHome("192.168.0.10", "family-desktop");
     int laptopId       = addHome("192.168.0.11", "personal-laptop");
     int phoneId        = addHome("192.168.0.12", "johns-phone");
-    int tabletId       = addHome("192.168.0.13", "family-tablet");
+    int tabletId       = addHome("192.168.0.13", "family-tablet"); // unused
+    (void)tabletId;
     int tvId           = addHome("192.168.0.14", "family-television");
     int smartFridgeId  = addHome("192.168.0.20", "smart-fridge");
 
     Simulation sim(network);
     Renderer   renderer(window, network);
 
-    bool paused = false;
+    bool paused    = false;
     sf::Clock clock;
+    double timeScale = 1.0; // 1 simulated second per real second
 
     std::cout << "Controls:\n"
               << "  Space: pause/resume\n"
+              << "  Up:    speed up (x10)\n"
+              << "  Down:  slow down (/10)\n"
               << "  Esc:   quit\n";
 
-    // traffic gen timers
+    // trfc generation timers
     double simTime = 0.0;
     double nextDnsQueryTime      = 0.0;
     double nextWebBurstTime      = 0.0;
@@ -118,13 +218,22 @@ int main() {
     std::uint64_t nextPacketId = 1;
 
     std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<int> webClientDist(0, 2); // pick among pc, laptop, phone
+    std::uniform_int_distribution<int> webClientDist(0, 2); // PC/laptop/phone
+
+    auto deviceIp = [&](int id) -> std::string {
+        if (auto* dev = dynamic_cast<HomeDevice*>(network.getDevice(id)))
+            return dev->ip();
+        if (auto* r = dynamic_cast<RouterDevice*>(network.getDevice(id)))
+            return r->ip();
+        return "0.0.0.0";
+    };
 
     auto sendLanPacket = [&](int srcId, int dstId,
                              const std::string& srcIp,
                              const std::string& dstIp,
                              std::uint16_t srcPort,
                              std::uint16_t dstPort,
+                             TransportProtocol transport,
                              ApplicationProtocol appProto,
                              std::size_t sizeBytes) {
         Packet p;
@@ -137,20 +246,10 @@ int main() {
         p.dstIp     = dstIp;
         p.srcPort   = srcPort;
         p.dstPort   = dstPort;
-        p.transport = TransportProtocol::TCP;
+        p.transport = transport;
         p.app       = appProto;
 
         network.spawnPacketOnLink(p, srcId, dstId);
-    };
-
-    auto deviceIp = [&](int id) -> std::string {
-        auto* dev = dynamic_cast<HomeDevice*>(network.getDevice(id));
-        if (!dev) {
-            auto* r = dynamic_cast<RouterDevice*>(network.getDevice(id));
-            if (r) return r->ip();
-            return "0.0.0.0";
-        }
-        return dev->ip();
     };
 
     // main loop
@@ -166,18 +265,27 @@ int main() {
                 } else if (event.key.code == sf::Keyboard::Space) {
                     paused = !paused;
                     std::cout << (paused ? "Paused\n" : "Resumed\n");
+                } else if (event.key.code == sf::Keyboard::Up) {
+                    if (timeScale < 10.0) timeScale *= 10.0;
+                    std::cout << "Time scale: " << timeScale << "x\n";
+                } else if (event.key.code == sf::Keyboard::Down) {
+                    if (timeScale > 0.001) timeScale /= 10.0;
+                    std::cout << "Time scale: " << timeScale << "x\n";
                 }
             }
         }
 
-        double dt = clock.restart().asSeconds();
-        if (dt > 0.1) dt = 0.1;
+        double dtReal = clock.restart().asSeconds();
+        if (dtReal > 0.1) dtReal = 0.1;
+        double dtSim = dtReal * timeScale;
 
         if (!paused) {
-            sim.step(dt);
-            simTime += dt;
+            sim.step(dtSim);
+            simTime += dtSim;
 
-            // dns queries every few seconds from a random client 
+            // LAN ---> router trfc
+
+            // DNS queries every few seconds from a random client
             if (simTime >= nextDnsQueryTime) {
                 int clientIdx = webClientDist(rng);
                 int clientId = (clientIdx == 0 ? familyPcId
@@ -185,18 +293,13 @@ int main() {
                                                 : phoneId);
                 sendLanPacket(clientId, routerId,
                               deviceIp(clientId), deviceIp(routerId),
-                              40'000 + clientIdx, 53, // src ephemeral, dst=domain name system
+                              static_cast<std::uint16_t>(40000 + clientIdx), 53,
+                              TransportProtocol::UDP,
                               ApplicationProtocol::DNS, 80);
-                // response from router (spoofing internet)
-                sendLanPacket(routerId, clientId,
-                              deviceIp(routerId), deviceIp(clientId),
-                              53, 40'000 + clientIdx,
-                              ApplicationProtocol::DNS, 120);
-
-                nextDnsQueryTime = simTime + 3.0; // every 3 seconds
+                nextDnsQueryTime = simTime + 3.0;
             }
 
-            // web browsing bursts (small https packets)
+            // web browsing bursts (HTTPS)
             if (simTime >= nextWebBurstTime) {
                 int clientIdx = webClientDist(rng);
                 int clientId = (clientIdx == 0 ? familyPcId
@@ -205,43 +308,99 @@ int main() {
 
                 for (int i = 0; i < 5; ++i) {
                     sendLanPacket(clientId, routerId,
-                                  deviceIp(clientId), "93.184.216.34", // example.com ipv4 addr
-                                  50'000 + i, 443,
+                                  deviceIp(clientId), deviceIp(routerId),
+                                  static_cast<std::uint16_t>(50000 + i), 443,
+                                  TransportProtocol::TCP,
                                   ApplicationProtocol::HTTPS, 900);
-                    // tiny https response packets coming back
-                    sendLanPacket(routerId, clientId,
-                                  "93.184.216.34", deviceIp(clientId),
-                                  443, 50'000 + i,
-                                  ApplicationProtocol::HTTPS, 1500);
                 }
 
-                nextWebBurstTime = simTime + 5.0; // roughly every 5 seconds
+                nextWebBurstTime = simTime + 5.0;
             }
 
-            // continuous video chunks from televisions (big https packets) ---
+            // continuous video chunks from TV
             if (simTime >= nextVideoChunkTime) {
-                // tv watching youtube
                 sendLanPacket(tvId, routerId,
-                              deviceIp(tvId), "142.250.0.0", // pretend youtube ipv4 addr
-                              60'000, 443,
-                              ApplicationProtocol::HTTPS, 4000); // request
+                              deviceIp(tvId), deviceIp(routerId),
+                              60000, 443,
+                              TransportProtocol::TCP,
+                              ApplicationProtocol::HTTPS, 4000);
 
-                // chunk of video data back
-                sendLanPacket(routerId, tvId,
-                              "142.250.0.0", deviceIp(tvId),
-                              443, 60'000,
-                              ApplicationProtocol::HTTPS, 50'000); // bigger
-
-                nextVideoChunkTime = simTime + 0.4; // 2.5 chunks/sec
+                nextVideoChunkTime = simTime + 0.4;
             }
 
-            // smart fridge occasional telemetry 
+            // smart fridge occasional telemetry
             if (simTime >= nextFridgePingTime) {
                 sendLanPacket(smartFridgeId, routerId,
                               deviceIp(smartFridgeId), deviceIp(routerId),
-                              55'000, 443,
+                              55000, 443,
+                              TransportProtocol::TCP,
                               ApplicationProtocol::HTTPS, 200);
                 nextFridgePingTime = simTime + 10.0;
+            }
+
+            // router processes arrivals and schedules WAN responses
+
+            auto* router = dynamic_cast<RouterDevice*>(network.getDevice(routerId));
+            if (router) {
+                // DNS responses after ~50 ms
+                for (const auto& q : router->pendingDns_) {
+                    ScheduledPacket sp;
+                    sp.fromNode = routerId;
+                    sp.toNode   = q.srcNodeId;
+                    sp.sendAt   = simTime + 0.050; // 50 ms WAN delay
+
+                    sp.pkt.id        = nextPacketId++;
+                    sp.pkt.srcNodeId = routerId;
+                    sp.pkt.dstNodeId = q.srcNodeId;
+                    sp.pkt.sizeBytes = 120;
+                    sp.pkt.createdAt = simTime;
+                    sp.pkt.srcIp     = router->ip();
+                    sp.pkt.dstIp     = q.srcIp;
+                    sp.pkt.srcPort   = 53;
+                    sp.pkt.dstPort   = q.srcPort;
+                    sp.pkt.transport = TransportProtocol::UDP;
+                    sp.pkt.app       = ApplicationProtocol::DNS;
+
+                    scheduledPackets.push_back(sp);
+                }
+                router->pendingDns_.clear();
+
+                // HTTPS responses after ~100 ms
+                for (const auto& req : router->pendingHttps_) {
+                    ScheduledPacket sp;
+                    sp.fromNode = routerId;
+                    sp.toNode   = req.srcNodeId;
+                    sp.sendAt   = simTime + 0.100; // 100 ms WAN RTT
+
+                    sp.pkt.id        = nextPacketId++;
+                    sp.pkt.srcNodeId = routerId;
+                    sp.pkt.dstNodeId = req.srcNodeId;
+                    sp.pkt.sizeBytes = 50000; // pretend video or HTML chunk
+                    sp.pkt.createdAt = simTime;
+                    sp.pkt.srcIp     = "142.250.0.0"; // fake YouTube IP
+                    sp.pkt.dstIp     = req.srcIp;
+                    sp.pkt.srcPort   = 443;
+                    sp.pkt.dstPort   = req.srcPort;
+                    sp.pkt.transport = TransportProtocol::TCP;
+                    sp.pkt.app       = ApplicationProtocol::HTTPS;
+
+                    scheduledPackets.push_back(sp);
+                }
+                router->pendingHttps_.clear();
+            }
+
+            // inject scheduled WAN responses whose time has come
+            for (std::size_t i = 0; i < scheduledPackets.size(); ) {
+                if (scheduledPackets[i].sendAt <= simTime) {
+                    network.spawnPacketOnLink(
+                        scheduledPackets[i].pkt,
+                        scheduledPackets[i].fromNode,
+                        scheduledPackets[i].toNode
+                    );
+                    scheduledPackets.erase(scheduledPackets.begin() + i);
+                } else {
+                    ++i;
+                }
             }
         }
 
